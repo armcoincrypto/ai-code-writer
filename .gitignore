@@ -3,3 +3,4 @@
 *.bak
 .env
 .env
+.env.local
