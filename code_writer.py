@@ -3,153 +3,70 @@
 ai-code-writer: generate complete Python scripts via your chosen AI model.
 
 Key features:
-  - Syntax check:         --syntax-check  (py_compile)
-  - Deps management:      --requirements  --install-deps
-  - Domain templates:     --domain fastapi|pandas|pytorch|click|aiogram
-  - Lint/typing:          --lint (flake8)  --typecheck (mypy)
-  - Auto-fix loop:        --fix N  (uses flake8/mypy/pytest diagnostics)
-  - Tests:                --with-tests  --expect-output "..."  --run-tests
-  - Provider rotation:    auto-rotate on stub/error (Gemini/OpenAI/Anthropic)
-  - Execution sandbox:    --exec-test
-  - Formatting:           --format (isort + black)
-
-Install (once):
-  pip install openai anthropic google-generativeai python-dotenv \
-              black isort pytest flake8 mypy
+  - Syntax check:     --syntax-check  (py_compile)
+  - Formatting:       --format (isort + black)
+  - Providers:        --provider stub|openai|auto
+                      * openai: OpenAI-compatible (works with OpenAI cloud
+                        or Ollama via OPENAI_BASE_URL + OPENAI_API_KEY=ollama)
+                      * auto: try openai; on error → safe stub
+  - Exec sandbox:     --exec-test + --exec-args
+  - Tests:            --with-tests  --expect-output "..."  --test-args "..."
+                      --run-tests
 """
+from __future__ import annotations
+
 import argparse
 import os
 import py_compile
 import re
+import shlex
 import subprocess
 import sys
 import textwrap
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Optional
+
+# ───────────────────────── helpers ─────────────────────────
 
 
-# --- safe accessor for union content blocks ---
-def _safe_text(x: object) -> str:
-    t = getattr(x, "text", None)
-    return t if isinstance(t, str) else ""
+def run_syntax_check(path: str) -> tuple[bool, str]:
+    """Check Python syntax."""
+    try:
+        py_compile.compile(path, doraise=True)
+        return True, ""
+    except py_compile.PyCompileError as e:
+        return False, str(e)
 
 
-# ── .env loader ──────────────────────────────────────────────────────
-try:
-    from pathlib import Path
-
-    from dotenv import load_dotenv
-
-    _here = Path(__file__).parent
-    load_dotenv(_here / ".env")
-except Exception:
-    pass
+@dataclass
+class WriteResult:
+    path: str
+    code: str
 
 
-# ── Prompt & domain guidance ─────────────────────────────────────────
-def get_prompt_template(name: str, task: str) -> str:
-    templates = {
-        "basic": textwrap.dedent(
-            f"""
-            You are an expert Python 3.11+ developer.
-            Write a COMPLETE, RUNNABLE single-file Python program that does:
-
-            TASK:
-            {task}
-
-            Include main() and if __name__ == '__main__'.
-            """
-        ),
-        "production": textwrap.dedent(
-            f"""
-            You are a senior Python engineer.
-            Write a production-ready Python 3.11+ module that accomplishes:
-
-            TASK:
-            {task}
-
-            REQUIREMENTS:
-            - Robust error handling & logging
-            - Type annotations & docstrings
-            - Include unit tests or doctests
-            - Provide setup instructions
-            """
-        ),
-        "tested": textwrap.dedent(
-            f"""
-            You are a Python developer focused on testing.
-            Create a Python 3.11+ script and a corresponding pytest file for:
-
-            TASK:
-            {task}
-
-            REQUIREMENTS:
-            - Script with main() and argparse
-            - Separate test file using pytest
-            - Tests cover edge cases
-            """
-        ),
-    }
-    return templates.get(name, templates["basic"]).strip()
+def ensure_dir(path: str) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
 
-def get_domain_guidance(domain: Optional[str]) -> str:
-    if not domain:
-        return ""
-    guides = {
-        "fastapi": textwrap.dedent(
-            """
-            DOMAIN:
-            - Use FastAPI. Provide a main FastAPI app with path operations.
-            - Add a '/debug' GET route that returns selected environment keys
-              (filter out secrets: keys containing 'KEY', 'TOKEN', 'SECRET', 'PASS').
-            - Provide uvicorn run instructions in __main__.
-            - Use Pydantic models and type hints.
-            - Keep handlers small and documented.
-            """
-        ),
-        "pandas": textwrap.dedent(
-            """
-            DOMAIN:
-            - Use pandas idioms (read_csv, groupby, assign, pipe).
-            - stdin-safe: if no args, only read stdin when data is present;
-              otherwise fall back to a tiny demo DataFrame.
-            - Include CLI args for input/output paths.
-            """
-        ),
-        "pytorch": textwrap.dedent(
-            """
-            DOMAIN:
-            - Use a tiny PyTorch training loop that runs fast (small model/batch).
-            - Set seeds; device = cuda if available else cpu.
-            - Provide a __main__ entry that trains for a few steps and prints metrics.
-            """
-        ),
-        "click": textwrap.dedent(
-            """
-            DOMAIN:
-            - Use Click for CLI with clear options and help.
-            - Provide a single entry command and subcommands if useful.
-            """
-        ),
-        "aiogram": textwrap.dedent(
-            """
-            DOMAIN:
-            - Use aiogram 3.x. Provide a minimal bot with router/handlers.
-            - Add a '/debug' command/handler that logs safe env keys
-              (filter secrets) without leaking tokens.
-            - Structure for clean shutdown and error handling.
-            """
-        ),
-    }
-    return guides.get(domain, "")
+def write_code(path: str, code: str) -> WriteResult:
+    ensure_dir(path)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(code.rstrip() + "\n")
+    return WriteResult(path, code)
 
 
-# ── Extract Python code from model output ────────────────────────────
+# ───────────────────── prompt & extraction ─────────────────────
 _CODE_FENCE = re.compile(r"```(?:python)?\n(.*?)```", re.DOTALL | re.IGNORECASE)
 
 
 def extract_code_blocks(text: str) -> str:
+    """
+    Take model text and return the first Python fenced block, or the raw text
+    trimmed to a plausible Python start.
+    """
     m = _CODE_FENCE.search(text or "")
     snippet = (m.group(1) if m else (text or "")).strip()
     lines = snippet.splitlines()
@@ -160,153 +77,76 @@ def extract_code_blocks(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-# ── File ops & formatting ────────────────────────────────────────────
-def ensure_dir(path: str) -> None:
-    d = os.path.dirname(os.path.abspath(path))
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
+def make_prompt(task: str) -> str:
+    return textwrap.dedent(
+        f"""
+        You are an expert Python 3.11+ developer.
+        Write a COMPLETE, RUNNABLE single-file Python program that accomplishes:
+
+        TASK:
+        {task}
+
+        REQUIREMENTS:
+        - Include a main() and if __name__ == '__main__' guard.
+        - Use only the standard library unless the task truly needs deps.
+        - Return ONLY a single fenced Python code block.
+        """
+    ).strip()
 
 
-@dataclass
-class WriteResult:
-    path: str
-    code: str
+# ───────────────────── providers (openai + stub) ─────────────────────
+def _stub_script(note: str = "Stub fallback") -> str:
+    return textwrap.dedent(
+        f"""\
+        #!/usr/bin/env python3
+        \"\"\"{note}\"\"\"
+        import sys
+
+        def main() -> None:
+            print('STUB')
+            print('Args:', sys.argv[1:])
+
+        if __name__ == '__main__':
+            main()
+        """
+    )
 
 
-def write_code(path: str, code: str) -> WriteResult:
-    ensure_dir(path)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(code.rstrip() + "\n")
-    return WriteResult(path, code)
-
-
-def run_formatting(path: str) -> None:
-    try:
-        subprocess.run([sys.executable, "-m", "isort", path], check=True)
-        subprocess.run([sys.executable, "-m", "black", path], check=True)
-        print(f"🔧 Formatted {path}")
-    except Exception as e:
-        print(f"⚠️ Formatting failed: {e}")
-
-
-def run_syntax_check(path: str) -> Tuple[bool, str]:
-    try:
-        py_compile.compile(path, doraise=True)
-        return True, ""
-    except py_compile.PyCompileError as e:
-        return False, str(e)
-
-
-# ── Linting & typing ────────────────────────────────────────────────
-def run_flake8(path: str) -> Tuple[int, str, str]:
-    try:
-        p = subprocess.run(
-            [sys.executable, "-m", "flake8", path], capture_output=True, text=True
-        )
-        return p.returncode, p.stdout, p.stderr
-    except FileNotFoundError:
-        return 127, "", "flake8 not installed. Install with: pip install flake8"
-
-
-def run_mypy(path: str) -> Tuple[int, str, str]:
-    try:
-        p = subprocess.run(
-            [sys.executable, "-m", "mypy", path], capture_output=True, text=True
-        )
-        return p.returncode, p.stdout, p.stderr
-    except FileNotFoundError:
-        return 127, "", "mypy not installed. Install with: pip install mypy"
-
-
-# ── Requirements management ─────────────────────────────────────────
-def get_requirements_for_domain(domain: Optional[str]) -> List[str]:
-    if not domain:
-        return []
-    reqs: Dict[str, List[str]] = {
-        "pandas": ["pandas>=2.2"],
-        "fastapi": ["fastapi>=0.112", "uvicorn>=0.30"],
-        "click": ["click>=8.1"],
-        "pytorch": [
-            "torch>=2.2; platform_system!='Darwin' or platform_machine!='arm64'"
-        ],  # skip heavy MPS nuance
-        "aiogram": ["aiogram>=3.4"],
-    }
-    return reqs.get(domain, [])
-
-
-def write_requirements(
-    reqs: List[str], path: str = "requirements.txt"
-) -> Optional[str]:
-    if not reqs:
-        return None
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(reqs) + "\n")
-    return path
-
-
-def install_requirements(req_path: str) -> int:
-    try:
-        p = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", req_path], text=True
-        )
-        return p.returncode
-    except Exception:
-        return 1
-
-
-# ── Providers ───────────────────────────────────────────────────────
-@dataclass
-class ProviderResult:
-    text: str
-
-
-class GeminiProvider:
-    def __init__(self, model: str):
-        self.model = model
-        self.api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-        if not self.api_key:
-            raise RuntimeError("Missing GOOGLE_API_KEY (or GEMINI_API_KEY)")
-        import google.generativeai as genai
-
-        self._genai = genai
-        self._genai.configure(api_key=self.api_key)
-
-    def generate(self, prompt: str, max_tokens: int) -> ProviderResult:
-        from google.api_core.exceptions import ResourceExhausted
-
-        fenced = "```python\n" + prompt + "\n```"
-        try:
-            resp = self._genai.GenerativeModel(self.model).generate_content(fenced)
-            code = getattr(resp, "text", "") or str(resp)
-        except ResourceExhausted:
-            print("⚠️ Gemini quota exhausted—using safe stub.")
-            return ProviderResult(text=(make_stub("Gemini quota exhausted." or "")))
-        except Exception as e:
-            try:
-                default = os.getenv("GEMINI_MODEL", "models/gemini-2.5-pro")
-                print(f"⚠️ Gemini error ({e}); retrying '{default}'…")
-                resp = self._genai.GenerativeModel(default).generate_content(fenced)
-                code = getattr(resp, "text", "") or str(resp)
-            except Exception as e2:
-                print(f"⚠️ Gemini fallback failed ({e2})—using safe stub.")
-                return ProviderResult(
-                    text=(make_stub("Gemini error; fallback failed." or ""))
-                )
-        return ProviderResult(text=(code or ""))
+def have_openai_credentials() -> bool:
+    """
+    True if we have an API key. OPENAI_BASE_URL may or may not be set.
+    When pointing to Ollama, set:
+      OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+      OPENAI_API_KEY=ollama
+    """
+    return bool(os.getenv("OPENAI_API_KEY"))
 
 
 class OpenAIProvider:
-    def __init__(self, model: str, temperature: float):
-        self.model = model
-        self.temperature = temperature
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
+    """
+    OpenAI-compatible client (works with OpenAI cloud or Ollama via base_url).
+    """
+
+    def __init__(self, model: str, temperature: float) -> None:
+        try:
+            from openai import OpenAI
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(f"openai package missing: {e}") from e
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL")
+        if not api_key:
             raise RuntimeError("Missing OPENAI_API_KEY")
-        from openai import OpenAI
 
-        self._client = OpenAI(api_key=self.api_key)
+        if base_url:
+            self._client = OpenAI(api_key=api_key, base_url=base_url)
+        else:
+            self._client = OpenAI(api_key=api_key)
 
-    def generate(self, prompt: str, max_tokens: int) -> ProviderResult:
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self.temperature = temperature
+
+    def generate(self, prompt: str, max_tokens: int) -> str:
         try:
             resp = self._client.chat.completions.create(
                 model=self.model,
@@ -314,98 +154,106 @@ class OpenAIProvider:
                 temperature=self.temperature,
                 max_tokens=max_tokens,
             )
-            return ProviderResult(text=(resp.choices[0].message.content or ""))
+            text = resp.choices[0].message.content or ""
+            code = extract_code_blocks(text) or _stub_script("No code block extracted")
+            return code
         except Exception as e:
-            print(f"⚠️ OpenAI error: {e} — using safe stub.")
-            return ProviderResult(text=(make_stub("OpenAI error." or "")))
+            print(f"⚠️ OpenAI error: {e} — using stub.", file=sys.stderr)
+            return _stub_script("OpenAI error")
 
 
-class AnthropicProvider:
-    def __init__(self, model: str, temperature: float):
-        self.model = model
-        self.temperature = temperature
-        self.api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not self.api_key:
-            raise RuntimeError("Missing ANTHROPIC_API_KEY")
-        import anthropic
-
-        self._client = anthropic.Anthropic(api_key=self.api_key)
-
-    def generate(self, prompt: str, max_tokens: int) -> ProviderResult:
-        try:
-            msg = self._client.messages.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=self.temperature,
-            )
-            parts = [
-                _safe_text(p) for p in msg.content if getattr(p, "type", "") == "text"
-            ]
-            return ProviderResult(text=("".join(parts or "")) if parts else str(msg))
-        except Exception as e:
-            print(f"⚠️ Anthropic error: {e} — using safe stub.")
-            return ProviderResult(text=(make_stub("Anthropic error." or "")))
-
-
-PROVIDERS = {
-    "gemini": (GeminiProvider, 0),
-    "openai": (OpenAIProvider, 1),
-    "anthropic": (AnthropicProvider, 1),
-}
-
-
-# ── Stub generator (always-valid Python) ────────────────────────────
-def make_stub(note: Optional[str] = None) -> str:
-    note_line = (note or "Stub fallback generated by ai-code-writer.").replace(
-        "\n", " "
-    )
-    return (
-        "#!/usr/bin/env python3\n"
-        "'''\n"
-        f"{note_line}\n"
-        "'''\n\n"
-        "def main() -> None:\n"
-        "    # TODO: replace stub with real implementation\n"
-        "    print('STUB')\n\n"
-        "if __name__ == '__main__':\n"
-        "    main()\n"
-    )
-
-
-# ── Pytest generation ───────────────────────────────────────────────
-def write_pytest_for_script(
-    script_path: str, expect_contains: Optional[str], domain: Optional[str]
+def generate_with_provider(
+    provider: str,
+    prompt: str,
+    model: str,
+    temp: float,
+    max_tokens: int,
 ) -> str:
-    import pathlib
+    """
+    provider:
+      - 'openai': use OpenAI-compatible client; on any error → stub
+      - 'stub':   always stub
+      - 'auto':   try openai (if creds) else stub
+    """
+    if provider == "openai":
+        try:
+            return OpenAIProvider(model, temp).generate(prompt, max_tokens)
+        except Exception as e:
+            print(f"⚠️ Provider init failed: {e} — stub.", file=sys.stderr)
+            return _stub_script("Provider init failed")
 
-    p = pathlib.Path(script_path)
+    if provider == "auto":
+        if have_openai_credentials():
+            try:
+                return OpenAIProvider(model, temp).generate(prompt, max_tokens)
+            except Exception as e:
+                print(f"⚠️ auto/openai failed: {e} — stub.", file=sys.stderr)
+        return _stub_script("auto fallback: no usable provider")
+
+    # default stub
+    return _stub_script("Stub provider")
+
+
+# ─────────────────────── formatting ────────────────────────
+def run_formatting(path: str) -> None:
+    try:
+        subprocess.run([sys.executable, "-m", "isort", path], check=True)
+        subprocess.run([sys.executable, "-m", "black", path], check=True)
+        print(f"🔧 Formatted {path}")
+    except Exception as e:
+        print(f"⚠️ Formatting failed: {e}", file=sys.stderr)
+
+
+# ───────────────────── tests (writer & runner) ──────────────────────
+def write_pytest_for_script(
+    script_path: str,
+    expect_contains: Optional[str],
+    test_args: str,
+) -> str:
+    """
+    Create test_<script>.py that runs the generated script with provided args,
+    asserts returncode==0, and optionally checks stdout contains a substring.
+    """
+    p = Path(script_path)
     test_path = str(p.with_name(f"test_{p.stem}.py"))
 
-    if domain == "pandas":
-        content = (
-            "import csv, pathlib, subprocess, sys, tempfile\n\n"
-            "def test_script_runs():\n"
-            f"    script = pathlib.Path(__file__).with_name('{p.name}')\n"
-            "    with tempfile.TemporaryDirectory() as td:\n"
-            "        path = pathlib.Path(td) / 'd.csv'\n"
-            "        with path.open('w', newline='') as f:\n"
-            "            w = csv.DictWriter(f, fieldnames=['value'])\n"
-            "            w.writeheader(); w.writerows([{'value':1},{'value':2},{'value':3}])\n"
-            "        proc = subprocess.run([sys.executable, str(script), str(path)], capture_output=True, text=True, timeout=10)\n"
-            "        assert proc.returncode == 0\n"
-        )
-    else:
-        content = (
-            "import subprocess, sys, pathlib\n\n"
-            "def test_script_runs():\n"
-            f"    script = pathlib.Path(__file__).with_name('{p.name}')\n"
-            "    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=10)\n"
-            "    assert proc.returncode == 0\n"
-        )
+    # keep shlex.split in test to handle quoted strings in --test-args
+    content = textwrap.dedent(
+        f"""\
+        import pathlib
+        import shlex
+        import subprocess
+        import sys
+
+        TEST_ARGS = {test_args!r}
+
+        def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                argv, capture_output=True, text=True, timeout=30
+            )
+
+        def test_script_runs_ok() -> None:
+            script = pathlib.Path(__file__).with_name({p.name!r})
+            args = [sys.executable, str(script)]
+            if TEST_ARGS:
+                args += shlex.split(TEST_ARGS)
+            cp = _run(args)
+            assert cp.returncode == 0, cp.stderr
+        """
+    )
 
     if expect_contains:
-        content += f"    assert {expect_contains!r} in proc.stdout\n"
+        content += textwrap.dedent(
+            f"""
+            def test_output_contains_expected_substring() -> None:
+                script = pathlib.Path(__file__).with_name({p.name!r})
+                args = [sys.executable, str(script)]
+                if TEST_ARGS:
+                    args += shlex.split(TEST_ARGS)
+                cp = _run(args)
+                assert {expect_contains!r} in cp.stdout
+            """
+        )
 
     with open(test_path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -414,313 +262,126 @@ def write_pytest_for_script(
 
 def run_pytests(test_path: str) -> int:
     try:
-        completed = subprocess.run(
+        proc = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", test_path],
             capture_output=True,
             text=True,
         )
-        if completed.stdout:
-            print(completed.stdout, end="")
-        if completed.returncode != 0 and completed.stderr:
-            print(completed.stderr, end="")
-        return completed.returncode
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.returncode != 0 and proc.stderr:
+            print(proc.stderr, end="")
+        return proc.returncode
     except FileNotFoundError:
-        print("⚠️ pytest not installed. Install with: pip install pytest")
+        print("⚠️ pytest not installed. pip install pytest", file=sys.stderr)
         return 127
 
 
-# ── Diagnostics & fix loop ──────────────────────────────────────────
-def run_checks(path: str, do_lint: bool, do_mypy: bool) -> Tuple[bool, str]:
-    ok = True
-    parts: List[str] = []
-
-    # syntax
-    syn_ok, syn_err = run_syntax_check(path)
-    if not syn_ok:
-        ok = False
-        parts.append("# syntax\n" + syn_err)
-
-    # flake8
-    if do_lint:
-        rc, out, err = run_flake8(path)
-        if rc not in (0, 127):
-            ok = False
-        if out:
-            parts.append("# flake8\n" + out)
-        if err and rc != 0:
-            parts.append("# flake8-stderr\n" + err)
-        if rc == 127:
-            parts.append(
-                "# flake8\nflake8 not installed. Install with: pip install flake8\n"
-            )
-
-    # mypy
-    if do_mypy:
-        rc, out, err = run_mypy(path)
-        if rc not in (0, 127):
-            ok = False
-        if out:
-            parts.append("# mypy\n" + out)
-        if err and rc != 0:
-            parts.append("# mypy-stderr\n" + err)
-        if rc == 127:
-            parts.append("# mypy\nmypy not installed. Install with: pip install mypy\n")
-
-    return ok, "\n".join(parts).strip()
-
-
-def refine_with_feedback(
-    provider, current_code: str, diagnostics: str, max_tokens: int
-) -> str:
-    feedback_prompt = textwrap.dedent(
-        f"""
-        You previously wrote this Python file:
-
-        ```python
-        {current_code}
-        ```
-
-        Tool diagnostics to fix:
-        {diagnostics}
-
-        Please return a corrected, COMPLETE single-file Python 3.11+ program that resolves these issues.
-        Only return one fenced Python code block.
-        """
-    ).strip()
-    result = provider.generate(feedback_prompt, max_tokens)
-    code = extract_code_blocks(_safe_text(result))
-    return code or make_stub("Fix attempt produced no code.")
-
-
-# ── Provider rotation ───────────────────────────────────────────────
-def is_stub(code: str) -> bool:
-    return "print('STUB')" in code or "Stub fallback" in code
-
-
-def rotate_providers_order(primary: str) -> List[str]:
-    order = ["gemini", "openai", "anthropic"]
-    if primary in order:
-        order.remove(primary)
-        return [primary] + order
-    return order
-
-
-def generate_with_rotation(
-    primary: str, prompt: str, model_name: str, temp: float, max_tokens: int
-) -> str:
-    order = rotate_providers_order(primary)
-    last_code = ""
-    for provider_name in order:
-        try:
-            prov_cls, needs_temp = PROVIDERS[provider_name]
-            provider = (
-                prov_cls(model_name, temp) if needs_temp else prov_cls(model_name)
-            )
-            print(f"➡️ Using {provider_name} model: {model_name}")
-            result = provider.generate(prompt, max_tokens)
-            code = extract_code_blocks(_safe_text(result)) or make_stub(
-                "No code block extracted."
-            )
-            if not is_stub(code):
-                return code
-            last_code = code
-            print(f"⚠️ {provider_name} returned stub; trying next provider…")
-        except Exception as e:
-            print(f"⚠️ Provider {provider_name} failed: {e}")
-            continue
-    return last_code or make_stub("All providers failed or returned stubs.")
-
-
-# ── CLI ─────────────────────────────────────────────────────────────
+# ─────────────────────────── CLI ───────────────────────────
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Generate Python code via AI.")
-    ap.add_argument("--provider", choices=PROVIDERS, required=True)
-    ap.add_argument("--task", required=True)
-    ap.add_argument("--out", default="generated.py")
-    ap.add_argument(
-        "--prompt-template", choices=["basic", "production", "tested"], default="basic"
+    parser = argparse.ArgumentParser(description="Generate Python code via AI.")
+    parser.add_argument(
+        "--provider",
+        choices=["stub", "openai", "auto"],
+        required=True,
+        help="Model provider or auto fallback",
     )
-    ap.add_argument(
-        "--domain",
-        choices=["fastapi", "pandas", "pytorch", "click", "aiogram"],
-        help="Domain guidance",
+    parser.add_argument("--model", help="Model name (OpenAI or compatible)")
+    parser.add_argument("--task", required=True, help="Natural-language code task")
+    parser.add_argument("--out", required=True, help="Output file path")
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--max-tokens", type=int, default=6000)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--format", action="store_true", help="Run isort + black")
+    parser.add_argument("--syntax-check", action="store_true")
+    parser.add_argument("--exec-test", action="store_true", help="Run script once")
+    parser.add_argument(
+        "--exec-args",
+        default="",
+        help='Args for the script during run (e.g. "--foo 1 --bar baz")',
     )
-    ap.add_argument("--model", help="Override model name for provider")
-    ap.add_argument(
-        "--temperature", type=float, default=0.2, help="OpenAI/Anthropic only"
-    )
-    ap.add_argument("--max-tokens", type=int, default=6000)
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--format", action="store_true")
-    ap.add_argument("--lint", action="store_true")
-    ap.add_argument("--typecheck", action="store_true")
-    ap.add_argument("--syntax-check", action="store_true")
-    ap.add_argument(
-        "--requirements", action="store_true", help="Emit requirements.txt for domain"
-    )
-    ap.add_argument(
-        "--install-deps", action="store_true", help="pip install -r requirements.txt"
-    )
-    ap.add_argument(
-        "--fix", type=int, default=0, help="Auto-fix iterations using diagnostics"
-    )
-    ap.add_argument(
-        "--exec-test", action="store_true", help="Run the generated code in a sandbox"
-    )
-    ap.add_argument(
+    parser.add_argument("--post-cmd", help="Shell command to run after writing")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
+
+    # new testing flags
+    parser.add_argument(
         "--with-tests",
         action="store_true",
-        help="Generate a pytest file alongside the script",
+        help="Write a pytest file for the generated script",
     )
-    ap.add_argument(
-        "--expect-output", help="Assert stdout contains this text during tests"
+    parser.add_argument(
+        "--run-tests",
+        action="store_true",
+        help="Run pytest for the generated test file",
     )
-    ap.add_argument(
-        "--run-tests", action="store_true", help="Run pytest on the generated test file"
+    parser.add_argument(
+        "--expect-output",
+        help="Assert stdout contains this text during tests",
     )
-    grp = ap.add_mutually_exclusive_group()
-    grp.add_argument("--verbose", action="store_true")
-    grp.add_argument("--quiet", action="store_true")
-    ap.add_argument("--post-cmd", help="Shell command after writing")
-    args = ap.parse_args()
+    parser.add_argument(
+        "--test-args",
+        default="--help",
+        help="Args to use when running tests (default: --help)",
+    )
+
+    args = parser.parse_args()
 
     def log(msg: str) -> None:
         if not args.quiet:
             print(msg)
 
-    def debug(msg: str) -> None:
-        if args.verbose and not args.quiet:
-            print(msg)
+    prompt = make_prompt(args.task)
 
-    # Resolve model (with sane defaults)
-    default_models = {
-        "gemini": "models/gemini-2.5-pro",
-        "openai": "gpt-3.5-turbo",
-        "anthropic": "claude-3-5-sonnet-20240620",
-    }
-    model_name = (
-        args.model
-        or os.getenv(f"{args.provider.upper()}_MODEL")
-        or default_models[args.provider]
+    code = generate_with_provider(
+        args.provider, prompt, args.model or "", args.temperature, args.max_tokens
     )
-
-    # Build prompt
-    base_prompt = get_prompt_template(args.prompt_template, args.task)
-    domain_extra = get_domain_guidance(args.domain)
-    prompt = base_prompt + (("\n\n" + domain_extra) if domain_extra else "")
-
-    # Requirements
-    reqs = get_requirements_for_domain(args.domain)
-    if args.requirements:
-        req_path = write_requirements(reqs)  # may be None
-        if req_path:
-            print(f"📦 Wrote {req_path}")
-            if args.install_deps:
-                rc = install_requirements(req_path)
-                if rc != 0:
-                    print("⚠️ Dependency installation failed (see logs).")
-
-    # Generate with rotation (avoids getting stuck on stubs)
-    code = generate_with_rotation(
-        args.provider, prompt, model_name, args.temperature, args.max_tokens
-    )
-
     if args.dry_run:
         print(code)
         return
 
-    # Write + format
     wr = write_code(args.out, code)
     print(f"✅ Wrote {wr.path}")
+
     if args.format:
         run_formatting(wr.path)
 
-    # Syntax check (fast & precise)
     if args.syntax_check:
-        syn_ok, syn_err = run_syntax_check(wr.path)
-        if not syn_ok:
-            print("# syntax\n" + syn_err)
+        ok, err = run_syntax_check(wr.path)
+        if not ok:
+            print(err)
 
-    # Lint/typecheck and optional fix loop (also can include pytest failures)
-    diagnostics = []
-    ok, diag = run_checks(wr.path, args.lint, args.typecheck)
-    if diag:
-        print(diag)
-        diagnostics.append(diag)
-
-    # Tests (optional)
-    test_path = None
+    # optional test file generation
+    test_path: Optional[str] = None
     if args.with_tests:
-        test_path = write_pytest_for_script(wr.path, args.expect_output, args.domain)
+        test_path = write_pytest_for_script(wr.path, args.expect_output, args.test_args)
         print(f"🧪 Wrote {test_path}")
         if args.format:
             run_formatting(test_path)
 
-    test_rc = 0
+    # optional run pytest
     if args.run_tests:
         if not test_path:
-            # fabricate a generic test if user asked to run tests without --with-tests
             test_path = write_pytest_for_script(
-                wr.path, args.expect_output, args.domain
+                wr.path, args.expect_output, args.test_args
             )
             print(f"🧪 Wrote {test_path}")
-        test_rc = run_pytests(test_path)
-        if test_rc != 0:
-            diagnostics.append("# pytest\nTests failed. See output above.")
+            if args.format:
+                run_formatting(test_path)
+        rc = run_pytests(test_path)
+        if rc != 0:
+            log("⚠️ Tests failed. See output above.")
 
-    # Fix loop
-    iter_left = max(0, int(args.fix))
-    while iter_left > 0 and (not ok or test_rc != 0):
-        debug(f"♻️ Auto-fix iteration (remaining: {iter_left})")
-        combined = "\n\n".join(diagnostics).strip() or "No diagnostics available."
-        new_code = refine_with_feedback(
-            provider=(
-                GeminiProvider(model_name)
-                if args.provider == "gemini"
-                else (
-                    OpenAIProvider(model_name, args.temperature)
-                    if args.provider == "openai"
-                    else AnthropicProvider(model_name, args.temperature)
-                )
-            ),
-            current_code=wr.code,
-            diagnostics=combined,
-            max_tokens=args.max_tokens,
-        )
-        wr = write_code(args.out, new_code)
-        if args.format:
-            run_formatting(wr.path)
-
-        ok, diag = run_checks(wr.path, args.lint, args.typecheck)
-        diagnostics = [diag] if diag else []
-        if args.run_tests:
-            if not test_path:
-                test_path = write_pytest_for_script(
-                    wr.path, args.expect_output, args.domain
-                )
-            test_rc = run_pytests(test_path)
-            if test_rc != 0:
-                diagnostics.append("# pytest\nTests failed. See output above.")
-        iter_left -= 1
-
-    if (args.lint or args.typecheck or args.run_tests) and (not ok or test_rc != 0):
-        log("⚠️ Diagnostics remain after fixes. Inspect output above.")
-
-    # Exec sandbox (optional)
+    # Exec sandbox (optional single run)
     if args.exec_test:
-        log(f"🧪 Executing {wr.path} in sandbox...")
-        try:
-            proc = subprocess.run(
-                [sys.executable, wr.path], capture_output=True, text=True, timeout=10
-            )
-            if proc.returncode != 0:
-                print("❌ Execution failed:")
-                print(proc.stderr)
-            else:
-                print("✅ Execution succeeded:")
-                print(proc.stdout, end="")
-        except Exception as e:
-            print(f"⚠️ Sandbox error: {e}")
+        log(f"🧪 Executing {wr.path} with args: {args.exec_args}")
+        cmd = [sys.executable, wr.path]
+        if args.exec_args:
+            cmd += shlex.split(args.exec_args)
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        print(proc.stdout, end="")
+        if proc.returncode != 0:
+            print(proc.stderr, file=sys.stderr)
 
     # Post-cmd
     if args.post_cmd and not args.quiet:
@@ -728,7 +389,7 @@ def main() -> None:
             subprocess.run(args.post_cmd, shell=True, check=True)
             print(f"🔗 Ran post-cmd: {args.post_cmd}")
         except Exception as e:
-            debug(f"Post-cmd failed: {e}")
+            log(f"⚠️ Post-cmd failed: {e}")
 
 
 if __name__ == "__main__":

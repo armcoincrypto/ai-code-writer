@@ -3,7 +3,10 @@ max-line-length = 88
 extend-ignore = E203, W503
 exclude = .venv, build, dist, .git
 per-file-ignores =
-  fib_custom.py:E501
-  echo.py:E501
-  rest_client.py:E266
-  code_writer.py:E501
+    fib_custom.py:E501
+    echo.py:E501
+    rest_client.py:E266
+    code_writer.py:E501
+    dev_doctor.py:E501
+
+# Allow long docstring lines in dev_doctor only

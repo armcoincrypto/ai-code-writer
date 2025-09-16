@@ -1,4 +1,8 @@
-def main() -> None:
+# unit_test.py
+
+
+def main():
+    """Main entry point for the application."""
     print("UNIT TEST OK")
 
 

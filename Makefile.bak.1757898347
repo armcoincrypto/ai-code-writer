@@ -1,0 +1,82 @@
+# -------- Makefile for ai-code-writer --------
+VENV=./.venv
+PY=$(VENV)/bin/python3
+PIP=$(PY) -m pip
+
+# Defaults you can override:  make deps.auto DOMAIN=pandas PROVIDER=gemini
+DOMAIN?=pandas
+PROVIDER?=gemini
+
+.PHONY: venv deps dev deps.auto pre-commit fmt checkfmt lint typecheck test gen run clean ci
+
+venv:
+	@test -x $(PY) || python3 -m venv $(VENV)
+
+dev: venv
+	$(PIP) install -r requirements-dev.txt
+
+# Install project runtime deps if requirements.txt exists
+deps: venv
+	@if [ -f requirements.txt ]; then \
+		$(PIP) install -r requirements.txt; \
+	else \
+		echo "No requirements.txt found; skipping deps"; \
+	fi
+
+# Auto-generate requirements.txt from domain and install them (no model calls)
+# Example: make deps.auto DOMAIN=fastapi
+deps.auto: venv
+	$(PY) code_writer.py --provider $(PROVIDER) \
+		--domain $(DOMAIN) \
+		--task "deps only" \
+		--out /tmp/_ignore.py \
+		--requirements --install-deps --dry-run
+
+pre-commit: dev
+	$(VENV)/bin/pre-commit install
+	-$(VENV)/bin/pre-commit autoupdate
+
+fmt:
+	$(PY) -m isort .
+	$(PY) -m black .
+
+checkfmt:
+	$(PY) -m isort --check-only .
+	$(PY) -m black --check .
+
+lint:
+	$(PY) -m flake8 .
+
+typecheck:
+	$(PY) -m mypy .
+
+test:
+	$(PY) -m pytest
+
+# Example generation task; edit as needed
+gen:
+	$(PY) code_writer.py --provider gemini \
+	  --task "print('hello')" \
+	  --out hello.py --format --syntax-check --exec-test --verbose
+
+run:
+	$(PY) hello.py
+
+clean:
+	rm -f *.pyc */*.pyc
+	find . -name __pycache__ -type d -exec rm -rf {} +
+
+# Run the full local CI stack: tooling deps, runtime deps, checks
+ci: venv dev deps checkfmt lint typecheck test
+	@echo "✅ Local CI complete"
+
+.PHONY: deps deps-dev bootstrap
+deps:
+	@python3 -m pip install -r requirements.txt || true
+
+deps-dev:
+	@python3 -m pip install -r requirements-dev.txt
+
+bootstrap: deps-dev
+	@pre-commit install
+	@echo "✅ bootstrap complete"

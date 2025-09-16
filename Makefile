@@ -1,48 +1,23 @@
-# -------- Makefile for ai-code-writer --------
-VENV=./.venv
-PY=$(VENV)/bin/python3
-PIP=$(PY) -m pip
+# ---- Config ----
+OAI_BASE ?= http://127.0.0.1:11434/v1
+OAI_KEY  ?= ollama
+MODEL    ?= llama3.2
+PY       := ./.venv/bin/python3
 
-# Defaults you can override:  make deps.auto DOMAIN=pandas PROVIDER=gemini
-DOMAIN?=pandas
-PROVIDER?=gemini
+export OPENAI_BASE_URL := $(OAI_BASE)
+export OPENAI_API_KEY  := $(OAI_KEY)
 
-.PHONY: venv deps dev deps.auto pre-commit fmt checkfmt lint typecheck test gen run clean ci
+.PHONY: deps fmt lint typecheck test verify gen gen-run gen-test gen-fastapi
 
-venv:
-	@test -x $(PY) || python3 -m venv $(VENV)
-
-dev: venv
-	$(PIP) install -r requirements-dev.txt
-
-# Install project runtime deps if requirements.txt exists
-deps: venv
-	@if [ -f requirements.txt ]; then \
-		$(PIP) install -r requirements.txt; \
-	else \
-		echo "No requirements.txt found; skipping deps"; \
-	fi
-
-# Auto-generate requirements.txt from domain and install them (no model calls)
-# Example: make deps.auto DOMAIN=fastapi
-deps.auto: venv
-	$(PY) code_writer.py --provider $(PROVIDER) \
-		--domain $(DOMAIN) \
-		--task "deps only" \
-		--out /tmp/_ignore.py \
-		--requirements --install-deps --dry-run
-
-pre-commit: dev
-	$(VENV)/bin/pre-commit install
-	-$(VENV)/bin/pre-commit autoupdate
+# ---- Toolchain ----
+deps:
+	$(PY) -m pip install --upgrade pip
+	if [ -f requirements.txt ]; then $(PY) -m pip install -r requirements.txt; fi
+	$(PY) -m pip install -r requirements-dev.txt
 
 fmt:
 	$(PY) -m isort .
 	$(PY) -m black .
-
-checkfmt:
-	$(PY) -m isort --check-only .
-	$(PY) -m black --check .
 
 lint:
 	$(PY) -m flake8 .
@@ -53,19 +28,50 @@ typecheck:
 test:
 	$(PY) -m pytest
 
-# Example generation task; edit as needed
+verify: fmt lint typecheck test
+	@echo "✅ verify complete"
+
+# ---- Generators ----
+# Usage: make gen TASK="print('hello')" OUT=hello.py
 gen:
-	$(PY) code_writer.py --provider gemini \
-	  --task "print('hello')" \
-	  --out hello.py --format --syntax-check --exec-test --verbose
+	$(PY) code_writer.py --provider openai --model $(MODEL) \
+	  --task "$(TASK)" --out "$(OUT)" --format --syntax-check
 
-run:
-	$(PY) hello.py
+# Usage: make gen-run TASK="build a CLI add two ints --a and --b and print sum" OUT=add_cli.py ARGS="--a 2 --b 5"
+gen-run:
+	$(PY) code_writer.py --provider openai --model $(MODEL) \
+	  --task "$(TASK)" --out "$(OUT)" --format --syntax-check
+	$(PY) "$(OUT)" $(ARGS)
+	@echo "✅ Generated and executed $(OUT)"
 
-clean:
-	rm -f *.pyc */*.pyc
-	find . -name __pycache__ -type d -exec rm -rf {} +
+# Usage: make gen-test TASK="print('UNIT TEST OK')" OUT=unit_ok.py EXPECT="UNIT TEST OK"
+gen-test:
+	$(PY) code_writer.py --provider openai --model $(MODEL) \
+	  --task "$(TASK)" --out "$(OUT)" --with-tests --expect-output "$(EXPECT)" \
+	  --format --run-tests --verbose
+	@echo "✅ Generated, formatted, and tested $(OUT)"
 
-# Run the full local CI stack: tooling deps, runtime deps, checks
-ci: venv dev deps checkfmt lint typecheck test
-	@echo "✅ Local CI complete"
+# Usage: make gen-fastapi
+gen-fastapi:
+	$(PY) code_writer.py --provider openai --model $(MODEL) \
+	  --domain fastapi --task "simple API with /debug route" \
+	  --out app.py --requirements --install-deps --format --syntax-check
+	@echo "🚀 Run: ./.venv/bin/python3 app.py"
+
+.PHONY: doctor
+doctor:
+	./.venv/bin/python3 dev_doctor.py --full
+
+.PHONY: doctor-verify
+doctor-verify:
+	./.venv/bin/python3 dev_doctor.py --full --run-verify
+
+.PHONY: checksum
+checksum:
+	./.venv/bin/python3 checksum_cli.py --help
+
+.PHONY: fmt-auto
+fmt-auto:
+	./.venv/bin/python3 -m isort .
+	./.venv/bin/python3 -m black .
+	./.venv/bin/autoflake --remove-all-unused-imports --remove-unused-variables -i $(shell git ls-files '*.py')
