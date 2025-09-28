@@ -1,0 +1,11 @@
+# Keep the app file in the context
+!app_fastapi.py
+
+# Ignore typical junk
+__pycache__/
+*.pyc
+.venv/
+.git/
+*.log
+.env*
+!.env.example
