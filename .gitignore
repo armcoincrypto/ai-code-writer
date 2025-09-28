@@ -7,3 +7,11 @@
 
 __pycache__/
 *.pyc
+
+# caches & temp
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+*.log
+*.tmp
+*.bak
