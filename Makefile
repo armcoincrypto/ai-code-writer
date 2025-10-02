@@ -8,8 +8,10 @@ logs:
 	docker compose logs -f
 
 smoke:
-	@curl -sf http://127.0.0.1:$(PORT)/health && echo
-	@curl -sf "http://127.0.0.1:$(PORT)/sum?a=2&b=3" && echo
+	@echo "→ /health"
+	@curl -sf --retry 10 --retry-delay 1 --retry-connrefused --retry-all-errors http://127.0.0.1:8000/health && echo
+	@echo "→ /sum?a=2&b=3"
+	@curl -sf --retry 10 --retry-delay 1 --retry-connrefused --retry-all-errors "http://127.0.0.1:8000/sum?a=2&b=3" && echo
 
 down:
 	docker compose down
