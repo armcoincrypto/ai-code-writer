@@ -1,0 +1,5 @@
+{
+  "dismiss_stale_reviews": true,
+  "required_approving_review_count": 0,
+  "require_code_owner_reviews": false
+}
